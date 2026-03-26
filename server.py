@@ -7,16 +7,22 @@ Then open: http://127.0.0.1:8080
 
 import csv
 import io
-import json
 import os
 import re
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, session, redirect
 from email_engine import validate_email, EmailStatus
+from functools import wraps
 
 app = Flask(__name__)
+
+# ── SET YOUR PASSWORD HERE ──────────────────────────────────
+APP_PASSWORD = "clearbounce2026"
+app.secret_key = "cb_secret_xk29zq"   # used to encrypt the session cookie
+# ───────────────────────────────────────────────────────────
+
 EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 
 EMAIL_COL_NAMES = [
@@ -27,6 +33,22 @@ EMAIL_COL_NAMES = [
 jobs = {}
 jobs_lock = threading.Lock()
 
+
+# ── Auth helpers ─────────────────────────────────────────────
+
+def logged_in():
+    return session.get("auth") == True
+
+def require_login(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not logged_in():
+            return jsonify({"error": "Not authenticated"}), 401
+        return f(*args, **kwargs)
+    return decorated
+
+
+# ── CSV helpers ───────────────────────────────────────────────
 
 def find_email_column(headers):
     for h in headers:
@@ -67,15 +89,79 @@ def parse_csv(file_bytes):
     raise ValueError("Could not read CSV file")
 
 
+# ── Routes ────────────────────────────────────────────────────
+
 @app.route("/")
 def index():
-    import os
-    index_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
-    with open(index_path, "r", encoding="utf-8") as f:
+    if not logged_in():
+        return redirect("/login")
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
+    with open(path, "r", encoding="utf-8") as f:
         return f.read(), 200, {"Content-Type": "text/html"}
 
 
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    error = ""
+    if request.method == "POST":
+        pwd = request.form.get("password", "")
+        if pwd == APP_PASSWORD:
+            session["auth"] = True
+            return redirect("/")
+        else:
+            error = "Wrong password. Try again."
+
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<title>ClearBounce — Login</title>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@700;800&family=Outfit:wght@400;500&display=swap" rel="stylesheet">
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:'Outfit',sans-serif;background:#05080F;color:#DFF0FF;min-height:100vh;
+  display:flex;align-items:center;justify-content:center}}
+.box{{background:#0A1020;border:1px solid #1C2B3A;border-radius:20px;padding:48px 40px;
+  width:100%;max-width:400px;text-align:center}}
+.logo{{font-family:'Syne',sans-serif;font-weight:800;font-size:24px;
+  background:linear-gradient(120deg,#00C8FF,#00E87A);-webkit-background-clip:text;
+  -webkit-text-fill-color:transparent;margin-bottom:8px}}
+.sub{{color:#4E6A85;font-size:14px;margin-bottom:32px}}
+input{{width:100%;padding:14px 18px;background:#0F1828;border:1.5px solid #1C2B3A;
+  border-radius:10px;color:#DFF0FF;font-family:'Outfit',sans-serif;font-size:15px;
+  outline:none;margin-bottom:14px;text-align:center;letter-spacing:2px}}
+input:focus{{border-color:#00C8FF}}
+input::placeholder{{letter-spacing:0;color:#4E6A85}}
+button{{width:100%;padding:14px;border-radius:10px;
+  background:linear-gradient(135deg,#00C8FF,#0066FF);border:none;color:#fff;
+  font-family:'Syne',sans-serif;font-weight:700;font-size:15px;cursor:pointer}}
+button:hover{{opacity:.9}}
+.err{{color:#FF3D5A;font-size:13px;margin-top:12px}}
+.lock{{font-size:40px;margin-bottom:20px}}
+</style>
+</head>
+<body>
+<div class="box">
+  <div class="lock">🔒</div>
+  <div class="logo">ClearBounce</div>
+  <div class="sub">Enter password to continue</div>
+  <form method="POST">
+    <input type="password" name="password" placeholder="Enter password" autofocus>
+    <button type="submit">Unlock →</button>
+  </form>
+  {"<div class='err'>❌ " + error + "</div>" if error else ""}
+</div>
+</body>
+</html>"""
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect("/login")
+
+
 @app.route("/api/verify/single", methods=["POST"])
+@require_login
 def verify_single():
     data  = request.json or {}
     email = (data.get("email") or "").strip()
@@ -86,6 +172,7 @@ def verify_single():
 
 
 @app.route("/api/verify/bulk/upload", methods=["POST"])
+@require_login
 def verify_bulk_upload():
     fast = request.form.get("fast", "false").lower() == "true"
     if "file" not in request.files:
@@ -162,6 +249,7 @@ def verify_bulk_upload():
 
 
 @app.route("/api/verify/bulk/status/<job_id>")
+@require_login
 def bulk_status(job_id):
     with jobs_lock:
         job = jobs.get(job_id)
@@ -179,6 +267,7 @@ def bulk_status(job_id):
 
 
 @app.route("/api/verify/bulk/preview/<job_id>")
+@require_login
 def bulk_preview(job_id):
     with jobs_lock:
         job = jobs.get(job_id)
@@ -200,6 +289,7 @@ def bulk_preview(job_id):
 
 
 @app.route("/api/verify/bulk/download/<job_id>")
+@require_login
 def bulk_download(job_id):
     filter_type = request.args.get("filter", "all")
     with jobs_lock:
@@ -242,7 +332,8 @@ def bulk_download(job_id):
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.environ.get("PORT", 5000))
     print(f"\n  ClearBounce is running!")
-    print(f"  Open this in your browser: http://127.0.0.1:{port}\n")
-    app.run(debug=False, host="127.0.0.1", port=port, threaded=True)
+    print(f"  Running on port {port}")
+    print(f"  Password: {APP_PASSWORD}\n")
+    app.run(debug=False, host="0.0.0.0", port=port, threaded=True)
